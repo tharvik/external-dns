@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -101,6 +102,8 @@ type ovhChange struct {
 	Action int
 }
 
+type ovhLogger struct{}
+
 // NewOVHProvider initializes a new OVH DNS based Provider.
 func NewOVHProvider(ctx context.Context, domainFilter endpoint.DomainFilter, endpoint string, apiRateLimit int, dryRun bool) (*OVHProvider, error) {
 	client, err := ovh.NewEndpointClient(endpoint)
@@ -108,6 +111,7 @@ func NewOVHProvider(ctx context.Context, domainFilter endpoint.DomainFilter, end
 		return nil, err
 	}
 
+	client.Logger = new(ovhLogger)
 	client.UserAgent = externaldns.Version
 
 	// TODO: Add Dry Run support
@@ -178,23 +182,22 @@ func (p *OVHProvider) ApplyChanges(ctx context.Context, changes *plan.Changes) e
 }
 
 func (p *OVHProvider) refresh(zone string) error {
-	log.Debugf("OVH: Refresh %s zone", zone)
-
 	p.apiRateLimiter.Take()
+	log.Debugf("OVH: Refresh %s zone", zone)
 	return p.client.Post(fmt.Sprintf("/domain/zone/%s/refresh", zone), nil, nil)
 }
 
 func (p *OVHProvider) change(change ovhChange) error {
-	p.apiRateLimiter.Take()
-
 	switch change.Action {
 	case ovhCreate:
+		p.apiRateLimiter.Take()
 		log.Debugf("OVH: Add an entry to %s", change.String())
 		return p.client.Post(fmt.Sprintf("/domain/zone/%s/record", change.Zone), change.ovhRecordFields, nil)
 	case ovhDelete:
 		if change.ID == 0 {
 			return ErrRecordToMutateNotFound
 		}
+		p.apiRateLimiter.Take()
 		log.Debugf("OVH: Delete an entry to %s", change.String())
 		return p.client.Delete(fmt.Sprintf("/domain/zone/%s/record/%d", change.Zone, change.ID), nil)
 	}
@@ -229,6 +232,7 @@ func (p *OVHProvider) zones() ([]string, error) {
 	filteredZones := []string{}
 
 	p.apiRateLimiter.Take()
+	log.Debug("OVH: Getting zones")
 	if err := p.client.Get("/domain/zone", &zones); err != nil {
 		return nil, err
 	}
@@ -257,6 +261,8 @@ func (p *OVHProvider) records(ctx *context.Context, zone *string, records chan<-
 		if cachedSoaItf, ok := p.cacheInstance.Get(*zone + "#soa"); ok {
 			cachedSoa := cachedSoaItf.(ovhSoa)
 
+			log.Debugf("OVH: Cache hit for %s", *zone)
+
 			m := new(dns.Msg)
 			m.SetQuestion(dns.Fqdn(*zone), dns.TypeSOA)
 			in, _, err := p.dnsClient.ExchangeContext(*ctx, m, strings.TrimSuffix(cachedSoa.Server, ".")+":53")
@@ -264,26 +270,30 @@ func (p *OVHProvider) records(ctx *context.Context, zone *string, records chan<-
 				if s, ok := in.Answer[0].(*dns.SOA); ok {
 					// do something with t.Txt
 					if s.Serial == cachedSoa.Serial {
+						log.Debugf("OVH: Cached SOA serial for %s matches DNS", *zone)
+
 						records <- cachedSoa.records
 						return nil
 					}
 				}
 			}
 
+			log.Debugf("OVH: Cached SOA serial for %s is invalid", *zone)
 			p.cacheInstance.Delete(*zone + "#soa")
 		}
 	}
 
-	log.Debugf("OVH: Getting records for %s", *zone)
-
-	p.apiRateLimiter.Take()
 	var soa ovhSoa
 	if p.UseCache {
+		p.apiRateLimiter.Take()
+		log.Debugf("OVH: Getting SOA for %s", *zone)
 		if err := p.client.Get("/domain/zone/"+*zone+"/soa", &soa); err != nil {
 			return err
 		}
 	}
 
+	p.apiRateLimiter.Take()
+	log.Debugf("OVH: Getting records for %s", *zone)
 	if err := p.client.Get(fmt.Sprintf("/domain/zone/%s/record", *zone), &recordsIds); err != nil {
 		return err
 	}
@@ -312,9 +322,8 @@ func (p *OVHProvider) records(ctx *context.Context, zone *string, records chan<-
 func (p *OVHProvider) record(zone *string, id uint64, records chan<- ovhRecord) error {
 	record := ovhRecord{}
 
-	log.Debugf("OVH: Getting record %d for %s", id, *zone)
-
 	p.apiRateLimiter.Take()
+	log.Debugf("OVH: Getting record %d for %s", id, *zone)
 	if err := p.client.Get(fmt.Sprintf("/domain/zone/%s/record/%d", *zone, id), &record); err != nil {
 		return err
 	}
@@ -417,4 +426,12 @@ func (c *ovhChange) String() string {
 		return fmt.Sprintf("%s zone (ID : %d) : %s %d IN %s %s", c.Zone, c.ID, c.SubDomain, c.TTL, c.FieldType, c.Target)
 	}
 	return fmt.Sprintf("%s zone : %s %d IN %s %s", c.Zone, c.SubDomain, c.TTL, c.FieldType, c.Target)
+}
+
+func (l ovhLogger) LogRequest(req *http.Request) {
+	log.Tracef("OVH: %s on %s", req.Method, req.URL)
+}
+
+func (l ovhLogger) LogResponse(res *http.Response) {
+	log.Tracef("OVH: %s for %s", res.Status, res.Request.URL)
 }
